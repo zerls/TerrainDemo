@@ -1,0 +1,53 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: Grass
+  m_Shader: {fileID: 4800000, guid: fecc010ccdb64416bedd7fb5844d1e75, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _GrassAlbedo:
+        m_Texture: {fileID: 2800000, guid: e91d38749424649338daebb29a4db0f2, type: 3}
+        m_Scale: {x: 1, y: 2}
+        m_Offset: {x: 0, y: 0}
+    - _GrassGloss:
+        m_Texture: {fileID: 2800000, guid: f3dc2619fc3364740b27ddf6febb6f0d, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Ints: []
+    m_Floats:
+    - _BladeWidth: 0.09
+    - _CurvedNormalAmount: 0.24
+    - _Cutoff: 0.056
+    - _Gloss: 0.362
+    - _Height: 1.15
+    - _PushTipForward: 0
+    - _ShadowIntensity: 0.705
+    - _SinOffsetRange: 0.3
+    - _TaperAmount: 1.07
+    - _Tilt: 0.83
+    - _WaveAmplitude: 1
+    - _WaveSpeed: 1
+    - _p1Offset: 0.1
+    - _p2Offset: 0.1
+    m_Colors:
+    - _BottomColor: {r: 0.2446755, g: 0.5698112, b: 0.16664289, a: 1}
+    - _TopColor: {r: 0.3584692, g: 0.9547169, b: 0.3584692, a: 1}
+  m_BuildTextureStacks: []

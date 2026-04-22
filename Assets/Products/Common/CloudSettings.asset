@@ -1,0 +1,45 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9b51391c93f801f4c8c9fcc3c8a158f2, type: 3}
+  m_Name: CloudSettings
+  m_EditorClassIdentifier: 
+  CloudAreaStartHeight: 1500
+  CloudAreaThickness: 4500
+  CloudShadowExtent: 10
+  CloudWeatherUVScale: {x: 1, y: 1}
+  CloudCoverage: 0.7
+  CloudDensity: 6.6
+  CloudNoiseScale: 1
+  CloudDirection: {x: 0.3, y: -0.2, z: 0.4}
+  CloudSpeed: 0.02
+  CloudAlbedo: {r: 1, g: 1, b: 1, a: 1}
+  CloudShadingSunLightScale: 10
+  CloudFogFade: 1
+  CloudEnableGroundContribution: 0
+  CloudPhaseForward: 0.67
+  CloudPhaseBackward: -0.35
+  CloudPhaseMixFactor: 0.5
+  CloudMultiScatterExtinction: 0.5
+  CloudMultiScatterScatter: 0.228
+  CloudPowderScale: 1
+  CloudPowderPow: 2
+  CloudGodRay: 0
+  CloudGodRayScale: 1
+  CloudMarchingStepNum: 64
+  CloudLightStepNum: 8
+  CloudLightBasicStep: 0.1
+  CloudLightStepMul: 2
+  CloudMaxTraceingDistance: 10
+  CloudTracingStartMaxDistance: 20
+  CloudBasicNoiseScale: 0.2
+  CloudDetailNoiseScale: 0.4
+  CloudSunLitMapOctave: 3

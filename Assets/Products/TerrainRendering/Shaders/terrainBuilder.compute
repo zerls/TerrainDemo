@@ -1,0 +1,363 @@
+#pragma kernel TraverseQuadTree
+#pragma kernel BuildLodMap
+#pragma kernel CullPatches
+
+#pragma multi_compile_local __ _REVERSE_Z
+#pragma multi_compile_local __ _FRUSTUM_CULL
+#pragma multi_compile_local __ _HIZ_CULL
+#pragma multi_compile_local __ _BOUNDS_DEBUG
+#pragma multi_compile_local __ _ENABLE_SEAM
+
+#include "./terrain_common.hlsl"
+
+Texture2D<float4> MinMaxHeightTexture;
+ConsumeStructuredBuffer<uint2> ConsumeNodeList;
+AppendStructuredBuffer<uint2> ProduceNodeList;
+AppendStructuredBuffer<uint3> AppendFinalNodeList;
+RWStructuredBuffer<NodeDescriptor> NodeDescriptors;
+
+RWTexture2D<float4> _LodMap;
+
+StructuredBuffer<uint3> FinalNodeList;
+AppendStructuredBuffer<PatchDescriptor> VisiblePatches;
+
+//*******世界尺寸参数********//
+//大地块大小
+float3 _TerrainSize;
+uint _PassLOD;
+float3 _CameraPosWS;
+float4 _CameraFrustumPlanes[6];
+int _BoundsHeightRedundance; //包围盒在高度方向留出冗余空间，应对MinMaxHeightTexture的精度不足
+float _HeightOffset;
+//
+/**
+记录了每个Lod级别的(nodeSize,patchExtent,nodeCount,sectorCountPerNode)
+其中:
+- nodeSize为Node的边长(米)
+- patchExtent等于nodeSize/16
+- nodeCount等于WorldSize/nodeSize
+- sectorCountPerNode等于2^lod
+**/
+uniform float4 WorldLodParams[6];
+uniform float4 _NodeEvaluationC; //节点评价系数。x为距离系数
+
+uniform float _HizDepthBias;
+//****以下这些参数全由HizMapPass全局设置得到***//
+Texture2D<float4> _HizMap;
+uniform float4 _HizMapSize;
+uniform float4x4 _HizCameraMatrixVP;
+uniform float3 _HizCameraPositionWS;
+//***********************//
+
+inline float GetNodeSize(uint lod) { return WorldLodParams[lod].x; }
+inline float GetNodeCount(uint lod) { return WorldLodParams[lod].z; }
+inline float GetPatchExtent(uint lod) { return WorldLodParams[lod].y; }
+inline uint GetSectorCountPerNode(uint lod) { return (uint)WorldLodParams[lod].w; }
+
+// 获取节点中心的 2D 世界坐标 (XZ)
+float2 GetNodePositionWS2(uint2 nodeIndex,uint lod){
+    float nodeMeterSize = GetNodeSize(lod);
+    float nodeCount = GetNodeCount(lod);
+    return (nodeIndex -(nodeCount - 1.0)*0.5) *nodeMeterSize;
+}
+
+float3 GetNodePositionWS(uint2 nodeIndex,uint lod){
+    float2 posXZ = GetNodePositionWS2(nodeIndex,lod);
+    float2 minMaxHeight = MinMaxHeightTexture.mips[lod + 3][nodeIndex].xy;
+    float posY =( (minMaxHeight.x + minMaxHeight.y) * 0.5 +_HeightOffset) * _TerrainSize.y;
+    return float3(posXZ.x,posY,posXZ.y);
+}
+
+//LOD 评价细分————判断该节点是否足够靠近相机，从而需要继续往下细分
+bool EvaluateNode(uint2 nodeIndex,uint lod){
+    float3 positionWS = GetNodePositionWS(nodeIndex,lod);
+    float nodeSize = GetNodeSize(lod);
+   float3 offset =_CameraPosWS -positionWS;
+    float sqrDistance =dot(offset,offset);
+
+    float threshold =nodeSize * _NodeEvaluationC.x;
+    float sqrThreshold =threshold * threshold;
+
+    return sqrDistance <sqrThreshold;
+}
+
+uint GetNodeIdOffset(uint lod) 
+{
+    uint m = MAX_TERRAIN_LOD - lod; // m 代表当前 LOD 距离最粗糙 LOD 细分了几次
+    uint baseCountSq = MAX_LOD_NODE_COUNT * MAX_LOD_NODE_COUNT; // 最粗糙层级的总节点数 N^2
+    // 核心数学公式：等比数列求和 N^2 * (4^m - 1) / 3
+    // 注意：1u << (2u * m) 完全等价于 4^m，且位运算速度极快
+    return baseCountSq * (((1u << (2u * m)) - 1u) / 3u);
+}
+
+uint GetNodeId(uint3 nodeId)
+{
+    uint nodeCount = MAX_LOD_NODE_COUNT << (MAX_TERRAIN_LOD - nodeId.z);
+    uint offset = GetNodeIdOffset(nodeId.z);
+    return offset + nodeId.y * nodeCount + nodeId.x;
+}
+
+uint GetNodeId(uint2 nodeIndex, uint lod)
+{
+    return GetNodeId(uint3(nodeIndex, lod));
+}
+
+//遍历四叉树，进行节点评价，生成AppendFinalNodeList和NodeDescriptors
+[numthreads(1,1,1)]
+void TraverseQuadTree (uint3 id : SV_DispatchThreadID)
+{
+    uint2 nodeIndex =ConsumeNodeList.Consume();
+    uint nodeId =GetNodeId(nodeIndex,_PassLOD);
+    NodeDescriptor desc =NodeDescriptors[nodeId];
+    if (_PassLOD >0 && EvaluateNode(nodeIndex,_PassLOD))
+    {
+        //divide
+        ProduceNodeList.Append(nodeIndex * 2);
+        ProduceNodeList.Append(nodeIndex * 2 + uint2(1,0));
+        ProduceNodeList.Append(nodeIndex * 2 + uint2(0,1));
+        ProduceNodeList.Append(nodeIndex * 2 + uint2(1,1));
+        desc.b_divide = true;
+    }else
+    {
+        AppendFinalNodeList.Append(uint3(nodeIndex, _PassLOD));
+        desc.b_divide = false;
+    }
+   NodeDescriptors[nodeId] =desc;
+}
+
+[numthreads(8,8,1)]
+void BuildLodMap (uint3 id : SV_DispatchThreadID)
+{
+    uint2 sectorIndex =id.xy;
+    [unroll]
+    for (uint lod = MAX_TERRAIN_LOD; lod >= 0; lod --)
+    {
+        uint sectorCount =GetSectorCountPerNode(lod);
+        uint2 nodeIndex =sectorIndex /sectorCount;
+        uint nodeId =GetNodeId(nodeIndex,lod);
+        NodeDescriptor desc =NodeDescriptors[nodeId];
+        if(!desc.b_divide)
+        {
+            _LodMap[sectorIndex] =lod *rcp(MAX_TERRAIN_LOD);
+            return;
+        }
+    }
+    _LodMap[sectorIndex] = 0;
+}
+
+PatchDescriptor CreatePatch(uint3 nodeIndex,uint2 patchOffset)
+{
+    uint lod =nodeIndex.z;
+    float nodeSizeMeter = GetNodeSize(lod);
+    float patchSizeMeter = nodeSizeMeter / PATCH_COUNT_PER_NODE;
+    float2 nodePositionWS = GetNodePositionWS2(nodeIndex.xy,lod);
+
+    uint2 patchIndex =nodeIndex.xy *PATCH_COUNT_PER_NODE +patchOffset;
+    float2 minMaxHeight =(MinMaxHeightTexture.mips[lod][patchIndex].rg +_HeightOffset) * _TerrainSize.y + float2(-_BoundsHeightRedundance,_BoundsHeightRedundance);
+    PatchDescriptor patch;
+    patch.lod =lod;
+    patch.position =nodePositionWS +(patchOffset -(PATCH_COUNT_PER_NODE -1)*0.5)*patchSizeMeter;
+    patch.minMaxHeight =minMaxHeight;
+    patch.lodTransPacked =0;
+    return patch;
+}
+
+Bounds GetPatchBounds(PatchDescriptor patch)
+{
+    float halfSize =GetPatchExtent(patch.lod);
+
+    Bounds bounds;
+    bounds.maxPosition.xz =patch.position +halfSize;
+    bounds.minPosition.xz =patch.position -halfSize;
+    bounds.minPosition.y = patch.minMaxHeight.x;
+    bounds.maxPosition.y = patch.minMaxHeight.y;
+    return bounds;
+}
+
+bool IsAABBOutSidePlane(float4 plane, float3 boundsMin, float3 boundsMax)
+{
+    // 1. 计算 AABB 的中心点,extents (长宽高的一半)
+    float3 center = (boundsMax + boundsMin) * 0.5;
+    float3 extents = (boundsMax - boundsMin) * 0.5;
+
+    // 2. 计算 AABB 在该平面法线方向上的“投影半径”
+    // 注意：平面的 xyz 代表法线，这里需要取绝对值 abs() 
+    float r = dot(extents, abs(plane.xyz));
+    
+    // 3. 计算中心点到平面的带符号距离，如果距离 d 小于负的投影半径 -r，说明整个 AABB 都在平面外侧
+    float d = dot(plane.xyz, center) + plane.w;
+    
+    return d + r < 0;
+}
+
+bool IsBoundsOutSidePlane(float4 plane,Bounds bounds){
+    return IsAABBOutSidePlane(plane,bounds.minPosition,bounds.maxPosition);
+}
+
+//视锥裁剪
+bool FrustumCull(float4 planes[6],Bounds bounds){
+    return IsBoundsOutSidePlane(planes[0],bounds) || 
+    IsBoundsOutSidePlane(planes[1],bounds) || 
+    IsBoundsOutSidePlane(planes[2],bounds) || 
+    IsBoundsOutSidePlane(planes[3],bounds) || 
+    IsBoundsOutSidePlane(planes[4],bounds) || 
+    IsBoundsOutSidePlane(planes[5],bounds);
+}
+
+// 获取世界空间 AABB 在屏幕空间 (UV + Depth) 下的精确包围盒
+Bounds GetBoundsUVD(Bounds boundsWS)
+{
+    float3 bMin = boundsWS.minPosition;
+    float3 bMax = boundsWS.maxPosition;
+
+    // 组合 AABB 的 8 个顶点
+    float3 corners[8] = {
+        float3(bMin.x, bMin.y, bMin.z), float3(bMax.x, bMin.y, bMin.z),
+        float3(bMin.x, bMax.y, bMin.z), float3(bMax.x, bMax.y, bMin.z),
+        float3(bMin.x, bMin.y, bMax.z), float3(bMax.x, bMin.y, bMax.z),
+        float3(bMin.x, bMax.y, bMax.z), float3(bMax.x, bMax.y, bMax.z)
+    };
+
+    //1.#INF 在某些较老的 Android 手机 (GLES3.0) 或 Metal 编译器上可能会报错。更安全的跨平台写法是使用按位转换：
+    // float3 minUVD = 1.#INF;  // 正无穷大
+    // float3 maxUVD = -1.#INF; // 负无穷大
+    float3 minUVD = asfloat(0x7F800000);  // IEEE 754 标准的正无穷
+    float3 maxUVD = asfloat(0xFF800000);  // 负无穷
+
+    // 使用 [unroll] 展开循环，GPU 会自动将其进行指令级并行优化
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        float4 posHS = mul(_HizCameraMatrixVP, float4(corners[i], 1.0));
+        float3 uvd = posHS.xyz / posHS.w;
+        uvd.xy = uvd.xy * 0.5 + 0.5;
+
+        // 处理跑到摄像机背后的点 (w < 0 代表在相机背后)
+        if (posHS.w < 0.0) 
+        {
+            #if _REVERSE_Z
+            uvd.z =1.0;
+            #else
+            uvd.z =0.0;
+            #endif
+        }
+
+        minUVD = min(minUVD, uvd);
+        maxUVD = max(maxUVD, uvd);
+    }
+
+    Bounds boundsUVD;
+    boundsUVD.minPosition = minUVD;
+    boundsUVD.maxPosition = maxUVD;
+    return boundsUVD;
+}
+
+bool HizOcclusionCull(Bounds bounds)
+{
+    // 1. 深度偏移防误剔除 (使用中心点计算视线方向，保证包围盒形变均匀)
+    float3 center = (bounds.maxPosition + bounds.minPosition) * 0.5;
+    float3 viewDir = normalize(center - _HizCameraPositionWS);
+    bounds.minPosition -= viewDir * _HizDepthBias;
+    bounds.maxPosition -= viewDir * _HizDepthBias;
+
+    // 2. 将世界包围盒转到屏幕 UV + Depth 空间
+    Bounds boundsUVD = GetBoundsUVD(bounds);
+    float3 minP = boundsUVD.minPosition;
+    float3 maxP = boundsUVD.maxPosition;
+
+    // 3. 计算 Mipmap 层级 (保证 AABB 映射后最多跨越 2x2 个像素)
+    float2 size = (maxP.xy - minP.xy) * _HizMapSize.x;
+    uint mip = (uint)clamp(ceil(log2(max(size.x, size.y))), 1.0, _HizMapSize.z - 1.0);
+
+    // 4. 计算采样坐标 (使用 >> 位移运算极速替代原代码的 / 和 pow 运算)
+    uint mipTexSize = (uint)_HizMapSize.x >> mip; 
+    
+    uint2 coordMin = clamp((uint2)(minP.xy * mipTexSize), 0, mipTexSize - 1);
+    uint2 coordMax = clamp((uint2)(maxP.xy * mipTexSize), 0, mipTexSize - 1);
+
+    // 5. 使用 .mips[mip][coord] 语法直接读取显存，速度远快于 SampleLevel
+    float d1 = _HizMap.mips[mip][coordMin].r;
+    float d2 = _HizMap.mips[mip][coordMax].r;
+    float d3 = _HizMap.mips[mip][uint2(coordMin.x, coordMax.y)].r;
+    float d4 = _HizMap.mips[mip][uint2(coordMax.x, coordMin.y)].r;
+
+    // 6. 遮挡比较
+    #if _REVERSE_Z
+    float objectDepth = maxP.z; // 物体自身最远处
+    float depthInTexture = min(min(d1, d2), min(d3, d4)); // 遮挡物最靠后处
+    return depthInTexture > objectDepth;
+    #else
+    float objectDepth = minP.z;
+    float depthInTexture = max(max(d1, d2), max(d3, d4));
+    return depthInTexture < objectDepth;
+    #endif
+}
+
+// 剔除函数：返回 true 代表被剔除（不可见），false 代表存活（可见）
+bool Cull(Bounds bounds)
+{
+    // 1. 视锥体剔除 (纯数学运算，极其廉价，必须放在第一步)
+    #if _FRUSTUM_CULL
+        if (FrustumCull(_CameraFrustumPlanes, bounds)) 
+            return true; 
+    #endif
+
+    // 2. Hi-Z 遮挡剔除 (需要贴图采样，开销较大，仅对视锥内的物体进行测试)
+    #if _HIZ_CULL
+        if (HizOcclusionCull(bounds)) 
+            return true;
+    #endif
+
+    // 通过所有测试，予以保留渲染
+    return false;
+}
+
+//返回一个node节点覆盖的Sector范围
+uint4 GetSectorBounds(uint3 nodeIndex){
+    uint sectorCountPerNode = GetSectorCountPerNode(nodeIndex.z);
+    uint2 sectorMin = nodeIndex.xy * sectorCountPerNode;
+    return uint4(sectorMin,sectorMin + sectorCountPerNode-1);
+}
+
+uint GetLod(int2 sectorLoc){
+    if (any(sectorLoc < 0) || any(sectorLoc >= SECTOR_COUNT_WORLD)) return 0;
+    return (uint)(_LodMap[sectorLoc].r * MAX_TERRAIN_LOD + 0.5);
+}
+
+// ========================================================
+// 计算 Patch 四条边的 LOD 降维过渡信息 (LodTrans)
+// ========================================================
+void SetLodTrans(inout PatchDescriptor patch, uint3 nodeIndex, uint2 patchOffset)
+{
+    int2 minBounds = (int2)GetSectorBounds(nodeIndex).xy;
+    int2 maxBounds = (int2)GetSectorBounds(nodeIndex).zw;
+
+    int lod = (int)nodeIndex.z;
+    int4 lodTrans = 0;
+
+    if (patchOffset.x == 0) // 左边缘
+        lodTrans.x = (int)  GetLod(minBounds + int2(-1, 0)) - lod;
+    if (patchOffset.y == 0) // 下边缘
+        lodTrans.y = (int)  GetLod(minBounds + int2(0, -1)) - lod;
+    if (patchOffset.x == 7) // 右边缘
+        lodTrans.z = (int)GetLod(maxBounds + int2(1, 0)) - lod;
+    if (patchOffset.y == 7) // 上边缘
+        lodTrans.w = (int)  GetLod(maxBounds + int2(0, 1)) - lod;
+
+    // 负数代表邻居 LOD 更精细（分辨率更高）或相等，不需要做退化处理，统一 clamp 到 0
+    // lodTrans 的四个分量 (x,y,z,w) 分别存入 0-7位, 8-15位, 16-23位, 24-31位
+    patch.lodTransPacked = PackLodTrans((uint4)max(0, lodTrans));
+}
+
+[numthreads(8,8,1)]
+void CullPatches (uint3 id : SV_DispatchThreadID,uint3 groupId:SV_GroupID,uint3 groupThreadId:SV_GroupThreadID)
+{
+    uint3 nodeIndex =FinalNodeList[groupId.x];
+    uint2 patchOffset = groupThreadId.xy;
+    //生成Patch
+    PatchDescriptor patch =CreatePatch(nodeIndex,patchOffset);
+    Bounds bounds =GetPatchBounds(patch);
+    if(Cull(bounds)) return;
+    SetLodTrans(patch,nodeIndex,patchOffset);
+    VisiblePatches.Append(patch);
+}

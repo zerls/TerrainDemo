@@ -1,0 +1,33 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e9bc0bf9256b14c9682b5dbd8aa85640, type: 3}
+  m_Name: AtmosphereSettings
+  m_EditorClassIdentifier: 
+  SeaLevel: 0
+  PlanetRadius: 6360000
+  AtmosphereHeight: 60000
+  SunLightIntensity: 30
+  SunLightColor: {r: 1, g: 1, b: 1, a: 1}
+  SunDiskAngle: 1
+  RayleighScatteringColor: {r: 0.5, g: 0.7, b: 1, a: 1}
+  RayleighScatteringScale: 0.81
+  RayleighScatteringScalarHeight: 8000
+  MieScatteringColor: {r: 1, g: 0.95, b: 0.9, a: 1}
+  MieScatteringScale: 1
+  MieAnisotropy: 0.8
+  MiePhaseParams: {x: 0.76, y: -0.4, z: 0.9, w: 1}
+  MieScatteringScalarHeight: 1200
+  OzoneAbsorptionScale: 1
+  OzoneLevelCenterHeight: 25000
+  OzoneLevelWidth: 15000
+  AerialPerspectiveDistance: 10000
+  AerialPerspectiveVoxelSize: {x: 32, y: 32, z: 32, w: 0}

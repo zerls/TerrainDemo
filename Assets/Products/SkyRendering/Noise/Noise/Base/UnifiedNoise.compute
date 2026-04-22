@@ -1,0 +1,421 @@
+#pragma kernel Perlin
+#pragma kernel Worley
+
+#include "NoiseLibrary.hlsl"
+
+RWStructuredBuffer<float4> _Colors;
+RWTexture2D<float4> _Texture2D;
+RWTexture3D<float4> _Texture3D;
+
+int _Resolution;
+float _Frequency;
+bool _Is3D;
+bool _IsTilable;
+float _RandomSeed;
+float3 _Evolution;
+int _FBMIteration;
+int _ReturnType;
+
+bool IsOutOfRange(int colorIndex) {
+    if (_Is3D) {
+        return colorIndex >= _Resolution * _Resolution * _Resolution;
+    }
+
+    return colorIndex >= _Resolution * _Resolution;
+}
+
+void WriteOutput(uint3 id, int colorIndex, float noise) {
+    _Colors[colorIndex] = float4(noise, noise, noise, 1);
+
+    if (_Is3D) {
+        _Texture3D[id.xyz] = float4(noise, noise, noise, 1);
+    }
+    else {
+        _Texture2D[id.xy] = float4(noise, noise, noise, 1);
+    }
+}
+
+struct PerlinPixel {
+    int3 coord;
+
+    float3 lerp;
+
+    float3 cornerVector0;
+    float3 cornerVector1;
+    float3 cornerVector2;
+    float3 cornerVector3;
+    float3 cornerVector4;
+    float3 cornerVector5;
+    float3 cornerVector6;
+    float3 cornerVector7;
+
+    float3 constantVector0;
+    float3 constantVector1;
+    float3 constantVector2;
+    float3 constantVector3;
+    float3 constantVector4;
+    float3 constantVector5;
+    float3 constantVector6;
+    float3 constantVector7;
+};
+
+float PerlinNoiseLerp(float l, float r, float t) {
+    t = ((6 * t - 15) * t + 10) * t * t * t;
+    return lerp(l, r, t);
+}
+
+float3 GetPerlinConstantVector(int blockNumber, int3 blockCoord, float randomSeed) {
+    if (_IsTilable) {
+        if (blockCoord.x == blockNumber) {
+            blockCoord.x = 0;
+        }
+
+        if (blockCoord.y == blockNumber) {
+            blockCoord.y = 0;
+        }
+
+        if (blockCoord.z == blockNumber) {
+            blockCoord.z = 0;
+        }
+    }
+
+    float3 vec = GetRandom3To3_Raw(blockCoord + _Evolution, length(blockCoord) * randomSeed);
+    vec = normalize(vec);
+    return vec;
+}
+
+float GetPerlinNoiseValue(uint3 id, float tile, float randomSeed) {
+    uint blockNumber = ceil(tile);
+    int blockSize = ceil((float)_Resolution / blockNumber);
+
+    PerlinPixel pixel = (PerlinPixel)0;
+    pixel.coord = id.xyz;
+
+    int3 blockCoord = PixelCoordToBlockCoord(blockSize, pixel.coord);
+    int3 blockMin = GetBlockMin(blockSize, blockCoord);
+    int3 blockMax = GetBlockMax(blockSize, blockCoord);
+
+    pixel.lerp.x = (pixel.coord.x - blockMin.x) / (blockSize - 1.0);
+    pixel.lerp.y = (pixel.coord.y - blockMin.y) / (blockSize - 1.0);
+    pixel.lerp.z = (pixel.coord.z - blockMin.z) / (blockSize - 1.0);
+
+    pixel.cornerVector0 = pixel.coord - float3(blockMin.x, blockMin.y, blockMin.z);
+    pixel.cornerVector1 = pixel.coord - float3(blockMin.x, blockMax.y, blockMin.z);
+    pixel.cornerVector2 = pixel.coord - float3(blockMax.x, blockMax.y, blockMin.z);
+    pixel.cornerVector3 = pixel.coord - float3(blockMax.x, blockMin.y, blockMin.z);
+
+    pixel.cornerVector0 /= blockSize;
+    pixel.cornerVector1 /= blockSize;
+    pixel.cornerVector2 /= blockSize;
+    pixel.cornerVector3 /= blockSize;
+
+    pixel.constantVector0 = GetPerlinConstantVector(blockNumber, blockCoord + int3(0, 0, 0), randomSeed);
+    pixel.constantVector1 = GetPerlinConstantVector(blockNumber, blockCoord + int3(0, 1, 0), randomSeed);
+    pixel.constantVector2 = GetPerlinConstantVector(blockNumber, blockCoord + int3(1, 1, 0), randomSeed);
+    pixel.constantVector3 = GetPerlinConstantVector(blockNumber, blockCoord + int3(1, 0, 0), randomSeed);
+
+    if (_Is3D) {
+        pixel.cornerVector4 = pixel.coord - float3(blockMin.x, blockMin.y, blockMax.z);
+        pixel.cornerVector5 = pixel.coord - float3(blockMin.x, blockMax.y, blockMax.z);
+        pixel.cornerVector6 = pixel.coord - float3(blockMax.x, blockMax.y, blockMax.z);
+        pixel.cornerVector7 = pixel.coord - float3(blockMax.x, blockMin.y, blockMax.z);
+
+        pixel.cornerVector4 /= blockSize;
+        pixel.cornerVector5 /= blockSize;
+        pixel.cornerVector6 /= blockSize;
+        pixel.cornerVector7 /= blockSize;
+
+        pixel.constantVector4 = GetPerlinConstantVector(blockNumber, blockCoord + int3(0, 0, 1), randomSeed);
+        pixel.constantVector5 = GetPerlinConstantVector(blockNumber, blockCoord + int3(0, 1, 1), randomSeed);
+        pixel.constantVector6 = GetPerlinConstantVector(blockNumber, blockCoord + int3(1, 1, 1), randomSeed);
+        pixel.constantVector7 = GetPerlinConstantVector(blockNumber, blockCoord + int3(1, 0, 1), randomSeed);
+    }
+
+    float dot0 = dot(pixel.cornerVector0, pixel.constantVector0);
+    float dot1 = dot(pixel.cornerVector1, pixel.constantVector1);
+    float dot2 = dot(pixel.cornerVector2, pixel.constantVector2);
+    float dot3 = dot(pixel.cornerVector3, pixel.constantVector3);
+
+    float dotA = PerlinNoiseLerp(dot0, dot3, pixel.lerp.x);
+    float dotB = PerlinNoiseLerp(dot1, dot2, pixel.lerp.x);
+    float dotC = PerlinNoiseLerp(dotA, dotB, pixel.lerp.y);
+
+    float noise = 0;
+
+    if (_Is3D) {
+        float dot4 = dot(pixel.cornerVector4, pixel.constantVector4);
+        float dot5 = dot(pixel.cornerVector5, pixel.constantVector5);
+        float dot6 = dot(pixel.cornerVector6, pixel.constantVector6);
+        float dot7 = dot(pixel.cornerVector7, pixel.constantVector7);
+
+        float dotD = PerlinNoiseLerp(dot4, dot7, pixel.lerp.x);
+        float dotE = PerlinNoiseLerp(dot5, dot6, pixel.lerp.x);
+        float dotF = PerlinNoiseLerp(dotD, dotE, pixel.lerp.y);
+
+        noise = PerlinNoiseLerp(dotC, dotF, pixel.lerp.z);
+    }
+    else {
+        noise = dotC;
+    }
+
+    noise = (noise + 1.0) / 2.0;
+    return noise;
+}
+
+struct WorleyPixel {
+    int3 coord;
+
+    float3 centerPoint_middle;
+    float3 neighborPoint0_middle;
+    float3 neighborPoint1_middle;
+    float3 neighborPoint2_middle;
+    float3 neighborPoint3_middle;
+    float3 neighborPoint4_middle;
+    float3 neighborPoint5_middle;
+    float3 neighborPoint6_middle;
+    float3 neighborPoint7_middle;
+
+    float3 centerPoint_near;
+    float3 neighborPoint0_near;
+    float3 neighborPoint1_near;
+    float3 neighborPoint2_near;
+    float3 neighborPoint3_near;
+    float3 neighborPoint4_near;
+    float3 neighborPoint5_near;
+    float3 neighborPoint6_near;
+    float3 neighborPoint7_near;
+
+    float3 centerPoint_far;
+    float3 neighborPoint0_far;
+    float3 neighborPoint1_far;
+    float3 neighborPoint2_far;
+    float3 neighborPoint3_far;
+    float3 neighborPoint4_far;
+    float3 neighborPoint5_far;
+    float3 neighborPoint6_far;
+    float3 neighborPoint7_far;
+};
+
+float GetWorleyDistance(float3 vec0, float3 vec1) {
+    float3 vec = vec0 - vec1;
+    float dist;
+
+    if (_ReturnType == 0 || _ReturnType == 2) {
+        dist = length(vec);
+    }
+    else {
+        vec = pow(abs(vec), 3.0);
+        dist = pow(vec.x + vec.y + vec.z, 1.0 / 3.0);
+    }
+
+    return dist;
+}
+
+float3 GetWorleyRandomPoint(int blockNumber, int blockSize, int3 blockCoord, float randomSeed) {
+    int3 blockMin = GetBlockMin(blockSize, blockCoord);
+
+    if (_IsTilable) {
+        if (blockCoord.x == blockNumber - 2) blockCoord.x = -2;
+        if (blockCoord.y == blockNumber - 2) blockCoord.y = -2;
+        if (blockCoord.z == blockNumber - 2) blockCoord.z = -2;
+
+        if (blockCoord.x == blockNumber - 1) blockCoord.x = -1;
+        if (blockCoord.y == blockNumber - 1) blockCoord.y = -1;
+        if (blockCoord.z == blockNumber - 1) blockCoord.z = -1;
+
+        if (blockCoord.x == blockNumber) blockCoord.x = 0;
+        if (blockCoord.y == blockNumber) blockCoord.y = 0;
+        if (blockCoord.z == blockNumber) blockCoord.z = 0;
+    }
+
+    float3 randomNumber = GetRandom3To3_Remapped(blockCoord + _Evolution, length(blockCoord) * randomSeed);
+    int3 pnt;
+    pnt.x = round(lerp(0, blockSize, randomNumber.x));
+    pnt.y = round(lerp(0, blockSize, randomNumber.y));
+    pnt.z = round(lerp(0, blockSize, randomNumber.z));
+
+    pnt += blockMin;
+    return pnt;
+}
+
+float GetWorleyNoiseValue(uint3 id, float tile, float randomSeed) {
+    int blockNumber = ceil(tile);
+    int blockSize = ceil((float)_Resolution / blockNumber);
+
+    WorleyPixel pixel = (WorleyPixel)0;
+    pixel.coord = id.xyz;
+
+    int3 blockCoord = PixelCoordToBlockCoord(blockSize, pixel.coord);
+
+    pixel.centerPoint_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord, randomSeed);
+    pixel.neighborPoint0_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, 0, 0), randomSeed);
+    pixel.neighborPoint1_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, 1, 0), randomSeed);
+    pixel.neighborPoint2_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, 1, 0), randomSeed);
+    pixel.neighborPoint3_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, 1, 0), randomSeed);
+    pixel.neighborPoint4_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, 0, 0), randomSeed);
+    pixel.neighborPoint5_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, -1, 0), randomSeed);
+    pixel.neighborPoint6_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, -1, 0), randomSeed);
+    pixel.neighborPoint7_middle = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, -1, 0), randomSeed);
+
+    if (_Is3D) {
+        pixel.centerPoint_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, 0, -1), randomSeed);
+        pixel.neighborPoint0_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, 0, -1), randomSeed);
+        pixel.neighborPoint1_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, 1, -1), randomSeed);
+        pixel.neighborPoint2_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, 1, -1), randomSeed);
+        pixel.neighborPoint3_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, 1, -1), randomSeed);
+        pixel.neighborPoint4_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, 0, -1), randomSeed);
+        pixel.neighborPoint5_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, -1, -1), randomSeed);
+        pixel.neighborPoint6_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, -1, -1), randomSeed);
+        pixel.neighborPoint7_near = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, -1, -1), randomSeed);
+
+        pixel.centerPoint_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, 0, 1), randomSeed);
+        pixel.neighborPoint0_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, 0, 1), randomSeed);
+        pixel.neighborPoint1_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, 1, 1), randomSeed);
+        pixel.neighborPoint2_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, 1, 1), randomSeed);
+        pixel.neighborPoint3_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, 1, 1), randomSeed);
+        pixel.neighborPoint4_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, 0, 1), randomSeed);
+        pixel.neighborPoint5_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(1, -1, 1), randomSeed);
+        pixel.neighborPoint6_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(0, -1, 1), randomSeed);
+        pixel.neighborPoint7_far = GetWorleyRandomPoint(blockNumber, blockSize, blockCoord + int3(-1, -1, 1), randomSeed);
+    }
+
+    float distances[27];
+
+    distances[0] = GetWorleyDistance(pixel.coord, pixel.centerPoint_middle);
+    distances[1] = GetWorleyDistance(pixel.coord, pixel.neighborPoint0_middle);
+    distances[2] = GetWorleyDistance(pixel.coord, pixel.neighborPoint1_middle);
+    distances[3] = GetWorleyDistance(pixel.coord, pixel.neighborPoint2_middle);
+    distances[4] = GetWorleyDistance(pixel.coord, pixel.neighborPoint3_middle);
+    distances[5] = GetWorleyDistance(pixel.coord, pixel.neighborPoint4_middle);
+    distances[6] = GetWorleyDistance(pixel.coord, pixel.neighborPoint5_middle);
+    distances[7] = GetWorleyDistance(pixel.coord, pixel.neighborPoint6_middle);
+    distances[8] = GetWorleyDistance(pixel.coord, pixel.neighborPoint7_middle);
+
+    if (_Is3D) {
+        distances[9] = GetWorleyDistance(pixel.coord, pixel.centerPoint_near);
+        distances[10] = GetWorleyDistance(pixel.coord, pixel.neighborPoint0_near);
+        distances[11] = GetWorleyDistance(pixel.coord, pixel.neighborPoint1_near);
+        distances[12] = GetWorleyDistance(pixel.coord, pixel.neighborPoint2_near);
+        distances[13] = GetWorleyDistance(pixel.coord, pixel.neighborPoint3_near);
+        distances[14] = GetWorleyDistance(pixel.coord, pixel.neighborPoint4_near);
+        distances[15] = GetWorleyDistance(pixel.coord, pixel.neighborPoint5_near);
+        distances[16] = GetWorleyDistance(pixel.coord, pixel.neighborPoint6_near);
+        distances[17] = GetWorleyDistance(pixel.coord, pixel.neighborPoint7_near);
+
+        distances[18] = GetWorleyDistance(pixel.coord, pixel.centerPoint_far);
+        distances[19] = GetWorleyDistance(pixel.coord, pixel.neighborPoint0_far);
+        distances[20] = GetWorleyDistance(pixel.coord, pixel.neighborPoint1_far);
+        distances[21] = GetWorleyDistance(pixel.coord, pixel.neighborPoint2_far);
+        distances[22] = GetWorleyDistance(pixel.coord, pixel.neighborPoint3_far);
+        distances[23] = GetWorleyDistance(pixel.coord, pixel.neighborPoint4_far);
+        distances[24] = GetWorleyDistance(pixel.coord, pixel.neighborPoint5_far);
+        distances[25] = GetWorleyDistance(pixel.coord, pixel.neighborPoint6_far);
+        distances[26] = GetWorleyDistance(pixel.coord, pixel.neighborPoint7_far);
+    }
+
+    float closestDistance0 = 999999;
+    float closestDistance1 = 999999;
+    float closestDistance2 = 999999;
+
+    if (_Is3D) {
+        for (int iii = 0; iii < 27; iii++) {
+            float tempDistance = distances[iii];
+
+            if (tempDistance < closestDistance0) {
+                closestDistance2 = closestDistance1;
+                closestDistance1 = closestDistance0;
+                closestDistance0 = tempDistance;
+            }
+            else if (tempDistance < closestDistance1) {
+                closestDistance2 = closestDistance1;
+                closestDistance1 = tempDistance;
+            }
+            else if (tempDistance < closestDistance2) {
+                closestDistance2 = tempDistance;
+            }
+        }
+    }
+    else {
+        for (int iii = 0; iii < 9; iii++) {
+            float tempDistance = distances[iii];
+
+            if (tempDistance < closestDistance0) {
+                closestDistance2 = closestDistance1;
+                closestDistance1 = closestDistance0;
+                closestDistance0 = tempDistance;
+            }
+            else if (tempDistance < closestDistance1) {
+                closestDistance2 = closestDistance1;
+                closestDistance1 = tempDistance;
+            }
+            else if (tempDistance < closestDistance2) {
+                closestDistance2 = tempDistance;
+            }
+        }
+    }
+
+    float noise;
+
+    if (_ReturnType == 0 || _ReturnType == 1) {
+        noise = closestDistance0;
+        noise /= blockSize;
+    }
+    else {
+        noise = closestDistance1 - closestDistance0;
+        noise /= blockSize;
+    }
+
+    return noise;
+}
+
+[numthreads(16,16,1)]
+void Perlin(uint3 id : SV_DispatchThreadID) {
+    int colorIndex = id.x;
+    colorIndex += _Resolution * id.y;
+    colorIndex += _Resolution * _Resolution * id.z;
+
+    if (IsOutOfRange(colorIndex)) {
+        return;
+    }
+
+    float noise = GetPerlinNoiseValue(id, _Frequency, _RandomSeed);
+
+    float currentTile = _Frequency;
+    float currentStrength = 1;
+    for (int iii = 0; iii < _FBMIteration; iii++) {
+        currentTile *= 2;
+        currentStrength /= 2;
+        if (currentTile >= _Resolution) {
+            currentTile /= 2;
+        }
+        noise += GetPerlinNoiseValue(id, currentTile, _RandomSeed + currentTile) * currentStrength;
+    }
+
+    WriteOutput(id, colorIndex, noise);
+}
+
+[numthreads(16,16,1)]
+void Worley(uint3 id : SV_DispatchThreadID) {
+    int colorIndex = id.x;
+    colorIndex += _Resolution * id.y;
+    colorIndex += _Resolution * _Resolution * id.z;
+
+    if (IsOutOfRange(colorIndex)) {
+        return;
+    }
+
+    float noise = GetWorleyNoiseValue(id, _Frequency, _RandomSeed);
+
+    float currentTile = _Frequency;
+    float currentStrength = 1;
+    for (int iii = 0; iii < _FBMIteration; iii++) {
+        currentTile *= 2;
+        currentStrength /= 2;
+        if (currentTile >= _Resolution) {
+            currentTile /= 2;
+        }
+        noise += GetWorleyNoiseValue(id, currentTile, _RandomSeed + currentTile) * currentStrength;
+    }
+
+    WriteOutput(id, colorIndex, noise);
+}

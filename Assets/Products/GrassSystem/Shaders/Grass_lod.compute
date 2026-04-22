@@ -1,0 +1,203 @@
+﻿#pragma kernel CSMain
+
+struct GrassBlade
+{
+    float3 position;
+    float rotAngle;
+    float hash;
+    float height;
+    float width;
+    float tilt;
+    float bend;
+    float3 surfaceNorm;
+    float windForce;
+    float sideBend;
+};
+
+struct ClumpParameters
+{
+    float pullToCentre;
+    float pointInSameDirection;
+    float baseHeight;
+    float heightRandom;
+    float baseWidth;
+    float widthRandom;
+    float baseTilt;
+    float tiltRandom;
+    float baseBend;
+    float bendRandom;
+};
+
+AppendStructuredBuffer<GrassBlade> _GrassBlades;
+StructuredBuffer<ClumpParameters> _ClumpParameters;
+uint _NumClumpParameters;
+
+Texture2D<float4> _HeightMap;       SamplerState sampler_HeightMap;
+Texture2D<float4> _DetailMap;       SamplerState sampler_DetailMap;
+Texture2D<float4> ClumpTex;         SamplerState sampler_ClumpTex;
+Texture2D<float4> _LocalWindTex;    SamplerState sampler_LocalWindTex;
+
+int _ResolutionX;
+int _ResolutionY;
+float _TileSize;
+
+float _GlobalDensity;
+float _CurrentLODDensity;
+float _CurrentLODScale;
+float _MaxRenderDistance;
+float _DistanceFadeLength;
+float _JitterStrength;
+// float _IsBillboard;
+
+float3 _TerrainPosition;
+float3 _TilePosition;
+float3 _CameraPosWS;
+float4x4 _VP_MATRIX;
+
+float3 _TerrainSize;
+float _HeightOffset;
+
+float _FrustumCullNearOffset;
+float _FrustumCullEdgeOffset;
+float _ClumpScale;
+
+float _LocalWindScale;
+float _LocalWindSpeed;
+float _LocalWindStrength;
+float _LocalWindRotateAmount;
+float _Time;
+
+
+// 无正弦哈希
+float Hash1(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float2 Hash2(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.xx + p3.yz) * p3.zy);
+}
+
+float Remap(float x) { return x * 2.0 - 1.0; }
+
+bool FrustumCull(float3 posWS)
+{
+    float4 posCS = mul(_VP_MATRIX, float4(posWS, 1.0));
+    float w = posCS.w;
+    if (w <= 0.0) return false;
+
+    bool xIn = posCS.x > -w - _FrustumCullEdgeOffset && posCS.x < w + _FrustumCullEdgeOffset;
+    bool yIn = posCS.y > -w - _FrustumCullEdgeOffset && posCS.y < w + _FrustumCullEdgeOffset;
+    bool zIn = posCS.z > -_FrustumCullNearOffset && posCS.z < w + _FrustumCullNearOffset;
+    return xIn && yIn && zIn;
+}
+
+float3 FitTerrainPosition(float3 posWS)
+{
+    float2 uv = (posWS.xz - _TerrainPosition.xz) / _TerrainSize.xz;
+    float height = _HeightMap.SampleLevel(sampler_HeightMap, uv, 0).r;
+    posWS.y = (height + _HeightOffset) * _TerrainSize.y;
+    return posWS;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_ResolutionX || id.y >= (uint)_ResolutionY) return;
+
+    float cellSizeX = _TileSize / (float)_ResolutionX;
+    float cellSizeZ = _TileSize / (float)_ResolutionY;
+
+    // 1. 基准世界坐标作为唯一的哈希种子
+    float3 basePos = _TilePosition;
+    basePos.x += (id.x + 0.5) * cellSizeX;
+    basePos.z += (id.y + 0.5) * cellSizeZ;
+
+    // 2. 使用绝对坐标带来的纯净白噪声进行抖动
+    float2 jitter = Hash2(basePos.xz) * 2.0 - 1.0;
+    float3 position = basePos;
+    position.x += jitter.x * cellSizeX * _JitterStrength;
+    position.z += jitter.y * cellSizeZ * _JitterStrength;
+
+    // 3. Clump 物理位移算法
+    float2 clumpUV = (position.xz - _TerrainPosition.xz) * _ClumpScale;
+    float4 clumpData = ClumpTex.SampleLevel(sampler_ClumpTex, clumpUV, 0);
+    uint clumpIndex = clamp((uint)(clumpData.r * _NumClumpParameters), 0, _NumClumpParameters - 1);
+    ClumpParameters bladeParameters = _ClumpParameters[clumpIndex];
+
+    float2 clumpCenterLocal = clumpData.yz;
+    float2 currentLocalUV = frac(clumpUV);
+    float2 dirToCenterLocal = clumpCenterLocal - currentLocalUV;
+    float2 pullWorldOffset = dirToCenterLocal / max(_ClumpScale, 0.0001);
+    position.xz += pullWorldOffset * bladeParameters.pullToCentre * 0.8;
+
+    // 4. 全局最远距离剔除与末端平滑衰减
+    float distToCam = distance(position.xz, _CameraPosWS.xz);
+    if (distToCam > _MaxRenderDistance) return;
+
+    float fadeRatio = 1.0;
+    float fadeStartDist = _MaxRenderDistance - _DistanceFadeLength;
+    if (distToCam > fadeStartDist)
+    {
+        fadeRatio = saturate((_MaxRenderDistance - distToCam) / max(0.001, _DistanceFadeLength));
+    }
+
+    // 5. 密度联合过滤
+    float finalDensity = _GlobalDensity * _CurrentLODDensity * fadeRatio;
+    if (finalDensity <= 0.0001) return;
+
+    float2 terrainUV = (position.xz - _TerrainPosition.xz) / _TerrainSize.xz;
+    float grassWeight = _DetailMap.SampleLevel(sampler_DetailMap, terrainUV, 0).g;
+
+    // 利用不相关系数打破随机种子的耦合
+    if (Hash1(basePos.xz * 1.31) >= grassWeight * finalDensity) return;
+
+    // 6. 贴合地形与视锥裁剪
+    position = FitTerrainPosition(position);
+    if (!FrustumCull(position)) return;
+
+    // 7. 风力与形态计算
+    float2 windUV = position.xz * _LocalWindScale + _Time * _LocalWindSpeed;
+    float2 localWindNoise = _LocalWindTex.SampleLevel(sampler_LocalWindTex, windUV, 0).xy;
+    float localWind = (localWindNoise.x * 2.0 - 1.0) * _LocalWindStrength;
+
+    GrassBlade blade;
+    blade.position = position;
+    blade.hash = Hash1(basePos.xz * 2.11);
+
+    blade.height = (bladeParameters.baseHeight + Remap(Hash1(basePos.xz * 4.91)) * bladeParameters.heightRandom) * _CurrentLODScale;
+    blade.width = (bladeParameters.baseWidth + Remap(Hash1(basePos.xz * 5.13)) * bladeParameters.widthRandom) * _CurrentLODScale;
+
+    blade.tilt = bladeParameters.baseTilt + Remap(Hash1(basePos.xz * 6.33)) * bladeParameters.tiltRandom;
+    blade.bend = bladeParameters.baseBend + Remap(Hash1(basePos.xz * 7.87)) * bladeParameters.bendRandom;
+    blade.bend += localWind * _LocalWindStrength;
+    blade.windForce = localWind;
+
+    // 法线构建
+    float3 bitangent = float3(1, 0, 0);
+    float3 tangent = float3(0, 0, 1);
+    float3 vertexBitangent = FitTerrainPosition(position + bitangent * 0.1);
+    float3 vertexTangent = FitTerrainPosition(position + tangent * 0.1);
+    float3 normal = normalize(cross((vertexTangent - position).xyz, (vertexBitangent - position).xyz));
+    blade.surfaceNorm = normal;
+
+    float3 posToCam = normalize(_CameraPosWS - position);
+
+
+    float angleToCenter = atan2(dirToCenterLocal.y, dirToCenterLocal.x);
+    float randomAngle = Hash1(basePos.xz * 3.73) * 3.14159 * 2.0;
+    float clumpTargetAngle = lerp(randomAngle, angleToCenter, bladeParameters.pullToCentre);
+    float baseAngle = lerp(clumpTargetAngle, clumpData.w * 3.14159 * 2.0, bladeParameters.pointInSameDirection);
+
+    blade.rotAngle = baseAngle + localWind * _LocalWindRotateAmount;
+    float2 bladeFacing = float2(cos(blade.rotAngle), sin(blade.rotAngle));
+    blade.sideBend = (1.0 - abs(dot(bladeFacing, normalize(posToCam.xz)))) * 0.5;
+
+
+    _GrassBlades.Append(blade);
+}

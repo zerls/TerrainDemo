@@ -1,0 +1,362 @@
+﻿#include "WindSimulation.hlsl"
+
+#pragma kernel CSWindShiftPosition
+#pragma kernel CSWindMotorVelocity
+#pragma kernel CSWindDiffusion
+#pragma kernel CSWindCalculateVorticity
+#pragma kernel CSWindApplyVorticity
+#pragma kernel CSWindAdvectionForward
+#pragma kernel CSWindAdvectionReverse 
+#pragma kernel CSWindAdvectionForward_MacCormack
+#pragma kernel CSWindAdvectionCorrection
+#pragma kernel CSWindMerge
+#pragma kernel CSWindMergeAndClear
+#pragma kernel CSWindDebugFlatten
+
+#define THREAD_GROUP_SIZE 8
+
+// ==========================================
+// 资源绑定 (Textures & Buffers)
+// ==========================================
+Texture3D<float4> WindBufferInput;
+RWTexture3D<float4> WindBufferOutput;
+RWTexture3D<float4> WindVelocityBuffer;     // 用于 Motor 原地修改
+RWTexture3D<float4> WindBufferIntermediate; // 用于 Vorticity 和 MacCormack 中转
+
+RWStructuredBuffer<int> WindAtomicBuffer;   // 用于 Scatter 原子累加
+RWStructuredBuffer<float3> WindDataForCPUBuffer;
+
+// 风源列表
+uniform int DirectionalMotorBufferCount;
+uniform int OmniMotorBufferCount;
+uniform int VortexMotorBufferCount;
+uniform int MovingMotorBufferCount;
+
+StructuredBuffer<MotorDirectional> DirectionalMotorBuffer;
+StructuredBuffer<MotorOmni> OmniMotorBuffer;
+StructuredBuffer<MotorVortex> VortexMotorBuffer;
+StructuredBuffer<MotorMoving> MovingMotorBuffer;
+
+
+// =========================================================================
+// [Pass 1] 空间平移：使风场始终包围目标
+// =========================================================================
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindShiftPosition(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    int3 src = (int3)id + ShiftOffset;
+    
+    // 越界区域判定为新进入的“无风区”清零
+    bool outB = any(src < 0) || any(src > VolumeSizeMinusOne);
+    WindBufferOutput[id] = outB ? float4(0,0,0,0) : WindBufferInput[src];
+}
+
+// =========================================================================
+// [Pass 2] 风源注入：原地累加所有风源的力 (In-Place)
+// =========================================================================
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindMotorVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    float3 cellPosWS = (float3)id + VolumePosOffset; 
+    float3 velocityWS = WindVelocityBuffer[id].xyz;
+
+    for(int i=0; i<DirectionalMotorBufferCount; i++) ApplyMotorDirectional(cellPosWS, DirectionalMotorBuffer[i], velocityWS);
+    for(int j=0; j<OmniMotorBufferCount; j++) ApplyMotorOmni(cellPosWS, OmniMotorBuffer[j], velocityWS);
+    for(int k=0; k<VortexMotorBufferCount; k++) ApplyMotorVortex(cellPosWS, VortexMotorBuffer[k], velocityWS);
+    for(int l=0; l<MovingMotorBufferCount; l++) ApplyMotorMoving(cellPosWS, MovingMotorBuffer[l], velocityWS);
+
+    WindVelocityBuffer[id] = float4(velocityWS, 0.0); 
+}
+
+// =========================================================================
+// [Pass 3] 流体扩散：LDS 预加载优化的拉普拉斯扩散
+// =========================================================================
+groupshared float3 m_Cache[1000]; // 10*10*10 Halo Cache
+
+void LoadToCache(uint idx, uint3 Gid)
+{
+    if (idx >= 1000) return;
+    int3 c = int3(idx % 10, (idx / 10) % 10, idx / 100);
+    int3 globalCoord = clamp(int3(Gid * 8) + c - 1, 0, VolumeSizeMinusOne);
+    m_Cache[idx] = WindBufferInput[globalCoord].xyz;
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindDiffusion(uint3 id : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    uint flatIdx = groupThreadID.x + groupThreadID.y * 8 + groupThreadID.z * 64;
+    LoadToCache(flatIdx, groupID);
+    LoadToCache(flatIdx + 512, groupID); // 512个线程协同加载1000个数据
+    GroupMemoryBarrierWithGroupSync();
+
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+
+    int3 c = (int3)groupThreadID + 1;
+    #define GET_CACHE(x,y,z) m_Cache[(z)*100 + (y)*10 + (x)]
+
+    float3 windInput = GET_CACHE(c.x, c.y, c.z);
+    float3 xr = GET_CACHE(c.x + 1, c.y, c.z);
+    float3 xl = GET_CACHE(c.x - 1, c.y, c.z);
+    float3 yr = GET_CACHE(c.x, c.y + 1, c.z);
+    float3 yl = GET_CACHE(c.x, c.y - 1, c.z);
+    float3 zr = GET_CACHE(c.x, c.y, c.z + 1);
+    float3 zl = GET_CACHE(c.x, c.y, c.z - 1);
+    
+    float3 laplacian = xr + xl + yr + yl + zr + zl - 6.0 * windInput;
+    WindBufferOutput[id] = float4(windInput + DiffusionForce * laplacian, 0.0);
+}
+
+// =========================================================================
+// [Pass 4] 涡度限制 (Vorticity Confinement)
+// =========================================================================
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindCalculateVorticity (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    int3 i = (int3)id;
+
+    float3 v_r = WindBufferInput[clampBorder(i + int3(1,0,0))].xyz;
+    float3 v_l = WindBufferInput[clampBorder(i - int3(1,0,0))].xyz;
+    float3 v_t = WindBufferInput[clampBorder(i + int3(0,1,0))].xyz;
+    float3 v_b = WindBufferInput[clampBorder(i - int3(0,1,0))].xyz;
+    float3 v_f = WindBufferInput[clampBorder(i + int3(0,0,1))].xyz;
+    float3 v_k = WindBufferInput[clampBorder(i - int3(0,0,1))].xyz;
+
+    float3 curl;
+    curl.x = (v_t.z - v_b.z) - (v_f.y - v_k.y);
+    curl.y = (v_f.x - v_k.x) - (v_r.z - v_l.z);
+    curl.z = (v_r.y - v_l.y) - (v_t.x - v_b.x);
+    curl *= 0.5;
+
+    // Intermediate XYZ 存旋度，W 存旋度强度
+    WindBufferIntermediate[id] = float4(curl, length(curl));
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindApplyVorticity (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    int3 i = (int3)id;
+    float3 velocity = WindBufferInput[id].xyz;
+    
+    // 1. 速度阈值熔断
+    float speed = length(velocity);
+    if (speed < 0.05) 
+    {
+        WindBufferOutput[id] = float4(velocity, 0.0);
+        return;
+    }
+
+    float4 c_c = WindBufferIntermediate[i];
+    float c_r = WindBufferIntermediate[clampBorder(i + int3(1,0,0))].w;
+    float c_l = WindBufferIntermediate[clampBorder(i - int3(1,0,0))].w;
+    float c_t = WindBufferIntermediate[clampBorder(i + int3(0,1,0))].w;
+    float c_b = WindBufferIntermediate[clampBorder(i - int3(0,1,0))].w;
+    float c_f = WindBufferIntermediate[clampBorder(i + int3(0,0,1))].w;
+    float c_k = WindBufferIntermediate[clampBorder(i - int3(0,0,1))].w;
+
+    float3 N = float3(c_r - c_l, c_t - c_b, c_f - c_k);
+    
+    // 2. 安全归一化
+    float N_length = length(N);
+    if (N_length < 1e-6) 
+    {
+        WindBufferOutput[id] = float4(velocity, 0.0);
+        return;
+    }
+    N /= N_length;
+
+    float3 confinementForce = cross(N, c_c.xyz) * VorticityScale;
+
+    // 3. 平滑过渡遮罩
+    confinementForce *= smoothstep(0.05, 0.2, speed);
+
+    // 4. 相对动量矢量截断
+    float forceMag = length(confinementForce);
+    float maxAllowedForce = speed * 0.1; 
+    
+    if (forceMag > maxAllowedForce)
+    {
+        confinementForce = (confinementForce / forceMag) * maxAllowedForce;
+    }
+
+    float3 finalVelocity = clamp(velocity + confinementForce, -MaxWindSpeed, MaxWindSpeed);
+    WindBufferOutput[id] = float4(finalVelocity, 0.0);
+}
+
+// =========================================================================
+// [Pass 5A] 平流系统 - 原子 Scatter 方案
+// =========================================================================
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindAdvectionForward (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    float3 velocity = WindBufferInput[id].xyz;
+    float3 targetPos = (float3)id + velocity * AdvectionForce;
+    
+    int3 moveCell = (int3)floor(targetPos);
+    float3 offsetNeb = frac(targetPos);
+    float3 offsetOri = 1.0 - offsetNeb;
+
+    AtomicAdd(WindAtomicBuffer, moveCell, velocity * (offsetOri.x * offsetOri.y * offsetOri.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(1,0,0), velocity * (offsetNeb.x * offsetOri.y * offsetOri.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(0,1,0), velocity * (offsetOri.x * offsetNeb.y * offsetOri.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(1,1,0), velocity * (offsetNeb.x * offsetNeb.y * offsetOri.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(0,0,1), velocity * (offsetOri.x * offsetOri.y * offsetNeb.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(1,0,1), velocity * (offsetNeb.x * offsetOri.y * offsetNeb.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(0,1,1), velocity * (offsetOri.x * offsetNeb.y * offsetNeb.z));
+    AtomicAdd(WindAtomicBuffer, moveCell + int3(1,1,1), velocity * (offsetNeb.x * offsetNeb.y * offsetNeb.z));
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindAdvectionReverse (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    float3 velocity = WindBufferInput[id].xyz;
+    float3 sourcePos = (float3)id - velocity * AdvectionForce; // 反向回溯
+    
+    int3 moveCell = (int3)floor(sourcePos);
+    float3 offsetNeb = frac(sourcePos);
+    float3 offsetOri = 1.0 - offsetNeb;
+
+    int3 p000 = moveCell;                 int3 p100 = moveCell + int3(1,0,0);
+    int3 p010 = moveCell + int3(0,1,0);   int3 p110 = moveCell + int3(1,1,0);
+    int3 p001 = moveCell + int3(0,0,1);   int3 p101 = moveCell + int3(1,0,1);
+    int3 p011 = moveCell + int3(0,1,1);   int3 p111 = moveCell + int3(1,1,1);
+
+    // 从 Intermediate 中读取目标网格的风力
+    float3 t000 = WindBufferIntermediate[clampBorder(p000)].xyz * (offsetOri.x * offsetOri.y * offsetOri.z);
+    float3 t100 = WindBufferIntermediate[clampBorder(p100)].xyz * (offsetNeb.x * offsetOri.y * offsetOri.z);
+    float3 t010 = WindBufferIntermediate[clampBorder(p010)].xyz * (offsetOri.x * offsetNeb.y * offsetOri.z);
+    float3 t110 = WindBufferIntermediate[clampBorder(p110)].xyz * (offsetNeb.x * offsetNeb.y * offsetOri.z);
+    float3 t001 = WindBufferIntermediate[clampBorder(p001)].xyz * (offsetOri.x * offsetOri.y * offsetNeb.z);
+    float3 t101 = WindBufferIntermediate[clampBorder(p101)].xyz * (offsetNeb.x * offsetOri.y * offsetNeb.z);
+    float3 t011 = WindBufferIntermediate[clampBorder(p011)].xyz * (offsetOri.x * offsetNeb.y * offsetNeb.z);
+    float3 t111 = WindBufferIntermediate[clampBorder(p111)].xyz * (offsetNeb.x * offsetNeb.y * offsetNeb.z);
+
+    // 源头抽走能量
+    AtomicAdd(WindAtomicBuffer, p000, -t000);  AtomicAdd(WindAtomicBuffer, p100, -t100);
+    AtomicAdd(WindAtomicBuffer, p010, -t010);  AtomicAdd(WindAtomicBuffer, p110, -t110);
+    AtomicAdd(WindAtomicBuffer, p001, -t001);  AtomicAdd(WindAtomicBuffer, p101, -t101);
+    AtomicAdd(WindAtomicBuffer, p011, -t011);  AtomicAdd(WindAtomicBuffer, p111, -t111);
+
+    // 注入当前网格
+    float3 cellData = t000 + t100 + t010 + t110 + t001 + t101 + t011 + t111;
+    AtomicAdd(WindAtomicBuffer, id, cellData);
+}
+
+// =========================================================================
+// [Pass 5B] 平流系统 - MacCormack Gather 方案
+// =========================================================================
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindAdvectionForward_MacCormack (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    float3 velocity = WindBufferInput[id].xyz;
+    WindBufferIntermediate[id] = float4(SampleTrilinear(WindBufferInput, (float3)id - velocity * AdvectionForce), 0.0);
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindAdvectionCorrection (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    
+    float3 velocity = WindBufferInput[id].xyz;
+    float3 forwardVal = WindBufferIntermediate[id].xyz;
+    float3 backVal = SampleTrilinear(WindBufferIntermediate, (float3)id + forwardVal * AdvectionForce);
+    
+    // 1. 误差锐化增强
+    float macCormackWeight = 0.65;
+    float3 finalVal = forwardVal - (backVal - velocity) * macCormackWeight;
+    
+    // 2. 局部极值拦截
+    int3 offsets[6] = { int3(1,0,0), int3(-1,0,0), int3(0,1,0), int3(0,-1,0), int3(0,0,1), int3(0,0,-1) };
+    float3 minV = velocity, maxV = velocity;
+    
+    for(int i = 0; i < 6; ++i) 
+    {
+        float3 neighborV = WindBufferInput[clampBorder((int3)id + offsets[i])].xyz;
+        minV = min(minV, neighborV);
+        maxV = max(maxV, neighborV);
+    }
+    
+    finalVal = clamp(finalVal, minV, maxV);
+    finalVal = clamp(finalVal, -MaxWindSpeed, MaxWindSpeed);
+    
+    WindBufferOutput[id] = float4(finalVal, 0.0);
+    
+    uint idx = id.x + id.y * VolumeSize.x + id.z * VolumeSize.x * VolumeSize.y;
+    WindDataForCPUBuffer[idx] = finalVal;
+}
+
+// =========================================================================
+// [Pass 6] 合并与清理 (针对 Scatter 原子缓冲)
+// =========================================================================
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindMerge (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    
+    int baseIdx = GetFlatIndex(id);
+    float x = PackIntToFloat(WindAtomicBuffer[baseIdx]);
+    float y = PackIntToFloat(WindAtomicBuffer[baseIdx + 1]);
+    float z = PackIntToFloat(WindAtomicBuffer[baseIdx + 2]);
+    
+    WindBufferOutput[id] = float4(clamp(float3(x, y, z), -MaxWindSpeed, MaxWindSpeed), 0.0);
+}
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, THREAD_GROUP_SIZE)]
+void CSWindMergeAndClear (uint3 id : SV_DispatchThreadID)
+{
+    if(any(id > (uint3)VolumeSizeMinusOne)) return;
+    
+    int baseIdx = GetFlatIndex(id);
+    float x = PackIntToFloat(WindAtomicBuffer[baseIdx]);
+    float y = PackIntToFloat(WindAtomicBuffer[baseIdx + 1]);
+    float z = PackIntToFloat(WindAtomicBuffer[baseIdx + 2]);
+    
+    float3 finalVelocity = clamp(float3(x, y, z), -MaxWindSpeed, MaxWindSpeed);
+    WindBufferOutput[id] = float4(finalVelocity, 0.0);
+    
+    uint idx = id.x + id.y * VolumeSize.x + id.z * VolumeSize.x * VolumeSize.y;
+    WindDataForCPUBuffer[idx] = finalVelocity;
+    
+    // 原地清零
+    WindAtomicBuffer[baseIdx]     = 0;
+    WindAtomicBuffer[baseIdx + 1] = 0;
+    WindAtomicBuffer[baseIdx + 2] = 0;
+}
+
+// =========================================================================
+// [Debug] 将 3D 纹理按 Y 轴切片平铺为 2D 纹理供 UI 显示 (最多1~2行)
+// =========================================================================
+RWTexture2D<float4> WindDebugTexture2D;
+uniform int DebugGridCols;
+
+[numthreads(8, 8, 1)]
+void CSWindDebugFlatten(uint3 id : SV_DispatchThreadID)
+{
+    uint sliceX = id.x / VolumeSize.x;
+    uint sliceY = id.y / VolumeSize.z; 
+    uint sliceIdx = sliceY * DebugGridCols + sliceX;
+
+    if (sliceIdx < (uint)VolumeSize.y)
+    {
+        int3 coord3D = int3(id.x % VolumeSize.x, sliceIdx, id.y % VolumeSize.z);
+        float3 vel = WindBufferInput[coord3D].xyz;
+        
+        float3 color = abs(vel) ;
+        // 绘制切片边框分隔线
+        if (id.x % VolumeSize.x == 0 || id.y % VolumeSize.z == 0) 
+            color = float3(0.8, 0.8, 0.8);
+
+        WindDebugTexture2D[id.xy] = float4(color, 1.0);
+    }
+    else
+    {
+        // 越界留白区域填充黑色
+        WindDebugTexture2D[id.xy] = float4(0, 0, 0, 1.0);
+    }
+}

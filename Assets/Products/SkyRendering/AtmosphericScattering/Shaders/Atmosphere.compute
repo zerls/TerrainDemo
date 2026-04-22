@@ -1,0 +1,183 @@
+﻿#pragma kernel CSTransmittanceLUT
+#pragma kernel CSMultiScatteringLUT
+#pragma kernel CSSkyViewLUT
+#pragma kernel CSAerialPerspectiveLUT
+
+#include "Helper.hlsl"
+#include "Scattering.hlsl"
+#include "Atmosphere.hlsl"
+
+
+
+cbuffer TextureParams
+{
+    uint _Width;
+    uint _Height;
+    float2 _SizePadding;
+};
+
+float _AerialPerspectiveDistance;
+float4 _AerialPerspectiveVoxelSize;
+
+RWTexture2D<float4> TransmittanceLUT;
+RWTexture2D<float4> MultiScatteringLUT;
+RWTexture2D<float4> SkyViewLUT;
+RWTexture2D<float4> AerialPerspectiveLUT;
+Texture2D<float4> TransmittanceLUT_ReadOnly; // 用于多次散射积分
+Texture2D<float4> MultiScatteringLUT_ReadOnly; // 用于多次散射积分
+SamplerState sampler_LinearClamp;
+
+//C# 端传入的内置变量,Compute Shader 默认无法直接访问 URP 渲染管线中的内置变量
+float3 _WorldSpaceCameraPos;
+float4 _ScreenParams;
+float4x4 unity_CameraToWorld;
+float3 _MainLightDirection;
+
+[numthreads(8, 8, 1)]
+void CSTransmittanceLUT (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)  return;
+    
+    float2 uv = (float2(id.xy) + 0.5) / float2(_Width, _Height);  // 在像素中心采样
+    AtmosphereParameter param = GetAtmosphereParameter();
+    
+    float bottomRadius = param.PlanetRadius;
+    float topRadius = param.PlanetRadius + param.AtmosphereHeight;
+
+    // 计算当前 UV 对应的 cos_theta (mu) 和 height (r)
+    float cos_theta = 0.0;
+    float r = 0.0;
+    UvToTransmittanceLutParams(bottomRadius, topRadius, uv, cos_theta, r);
+
+    // 构建射线
+    float sin_theta = sqrt(saturate(1.0 - cos_theta * cos_theta));
+    float3 viewDir = float3(sin_theta, cos_theta, 0);
+    float3 eyePos = float3(0, r, 0);
+
+    // 光线和大气层外边界求交
+    float dis = RayIntersectSphere(float3(0, 0, 0), topRadius, eyePos, viewDir);
+    
+    // 如果没有交点（不应该发生），返回白色（无吸收）
+    if (dis < 0.0)
+    {
+        TransmittanceLUT[id.xy] = float4(1, 1, 1, 1);
+        return;
+    }
+    
+    float3 hitPoint = eyePos + viewDir * dis;
+
+    // RayMarching 计算 Transmittance
+    float3 transmittance = Transmittance(param, eyePos, hitPoint);
+
+    // 写入结果
+    TransmittanceLUT[id.xy] = float4(transmittance, 1.0);
+    
+}
+
+
+
+[numthreads(8, 8, 1)]
+void CSMultiScatteringLUT (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+
+    // 计算 UV 坐标 [0, 1],在像素中心采样
+    float2 uv = (float2(id.xy) + 0.5) / float2(_Width, _Height);
+    
+    AtmosphereParameter param = GetAtmosphereParameter();
+    
+    float mu_s = uv.x * 2.0 - 1.0;
+    float r = uv.y * param.AtmosphereHeight + param.PlanetRadius;
+
+    float cos_theta = mu_s;
+    float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+    float3 lightDir = float3(sin_theta, cos_theta, 0);
+    float3 p = float3(0, r, 0);
+
+    float3 multiScattering = IntegralMultiScattering(param, p, lightDir, TransmittanceLUT_ReadOnly, sampler_LinearClamp);
+    
+    MultiScatteringLUT[id.xy] = float4(multiScattering, 1.0);
+    
+    //----------------Debug 放大多次散射结果50倍以便观察--------------
+    // MultiScatteringLUT[id.xy] = float4(multiScattering *50.0, 1.0);
+            
+}
+
+
+
+//Single +  Multi Scattering 
+[numthreads(8, 8, 1)]
+void CSSkyViewLUT (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)  return;
+
+    // 计算 UV 坐标 [0, 1],在像素中心采样
+    float2 uv = (float2(id.xy) + 0.5) / float2(_Width, _Height);
+    AtmosphereParameter param = GetAtmosphereParameter();
+    
+    float3 viewDir = UVToViewDir(uv);
+    float3 lightDir = _MainLightDirection;
+                
+    float h = _WorldSpaceCameraPos.y - param.SeaLevel + param.PlanetRadius;
+    float3 eyePos = float3(0, h, 0);
+
+    float3 skyColor = CaculateSkyView(
+        param, eyePos, viewDir, lightDir, -1.0f,
+        TransmittanceLUT_ReadOnly, MultiScatteringLUT_ReadOnly, sampler_LinearClamp
+    );
+    SkyViewLUT[id.xy] = float4(skyColor, 1.0);
+}
+
+// Aerial Perspective LUT
+[numthreads(8, 8, 1)]
+void CSAerialPerspectiveLUT (uint3 id : SV_DispatchThreadID)
+{
+    // 检查线程是否在纹理范围内
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    // 计算 UV 坐标 [0, 1]
+    // 在像素中心采样
+    float3 uv = float3((float2(id.xy) + 0.5) / float2(_Width, _Height),0.0);
+    AtmosphereParameter param = GetAtmosphereParameter();
+
+    float4 color = float4(0, 0, 0, 1);
+    
+    uv.x *= _AerialPerspectiveVoxelSize.x * _AerialPerspectiveVoxelSize.z;  // X * Z
+    uv.z = int(uv.x / _AerialPerspectiveVoxelSize.z) / _AerialPerspectiveVoxelSize.x;
+    uv.x = fmod(uv.x, _AerialPerspectiveVoxelSize.z) / _AerialPerspectiveVoxelSize.x;
+    uv.xyz += 0.5 / _AerialPerspectiveVoxelSize.xyz;
+
+    float aspect = _ScreenParams.x / _ScreenParams.y;
+    float3 viewDir = - normalize(mul(unity_CameraToWorld, float4(
+        (uv.x * 2.0 - 1.0) * 1.0, 
+        (uv.y * 2.0 - 1.0) / aspect, 
+        1.0, 0.0
+    )).xyz);
+    
+    float3 lightDir = _MainLightDirection;
+                
+    float h = _WorldSpaceCameraPos.y - param.SeaLevel + param.PlanetRadius;
+    float3 eyePos = float3(0, h, 0);
+
+    float maxDis = uv.z * _AerialPerspectiveDistance;
+
+    // inScattering
+    color.rgb = CaculateSkyView(
+        param, eyePos, viewDir, lightDir, maxDis,
+        TransmittanceLUT_ReadOnly, MultiScatteringLUT_ReadOnly, sampler_LinearClamp
+    );
+
+    // transmittance
+    float3 voxelPos = eyePos + viewDir * maxDis;
+    float3 t1 = TransmittanceToTopOfAtmosphere(param, eyePos, viewDir, TransmittanceLUT_ReadOnly, sampler_LinearClamp);
+    float3 t2 = TransmittanceToTopOfAtmosphere(param, voxelPos, viewDir, TransmittanceLUT_ReadOnly, sampler_LinearClamp);
+    float3 t = t1 / t2;
+    color.a = dot(t, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+
+    float2 _uv = id.xy;
+    _uv.y = _Height - _uv.y;
+    
+    AerialPerspectiveLUT[_uv] = color;
+    
+}

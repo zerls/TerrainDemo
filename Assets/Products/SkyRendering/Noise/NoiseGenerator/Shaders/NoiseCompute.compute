@@ -1,0 +1,158 @@
+#pragma kernel Perlin
+#pragma kernel Worley
+#pragma kernel Voronoi
+#pragma kernel Simplex
+#pragma kernel Fractal
+#pragma kernel BlueNoise
+
+RWStructuredBuffer<float4> Colors;
+int width;
+int height;
+int depth;
+int generate3D;
+float scale;
+float3 offset;
+int octaves;
+float persistence;
+float lacunarity;
+
+#include "./NoiseCommon.hlsl"
+
+bool isOutOfBounds(uint3 id) {
+    if (id.x >= width || id.y >= height) {
+        return true;
+    }
+
+    if (generate3D != 0 && id.z >= depth) {
+        return true;
+    }
+
+    return generate3D == 0 && id.z > 0;
+}
+
+int getLinearIndex(uint3 id) {
+    return id.x + width * (id.y + height * id.z);
+}
+
+void writeNoise(uint3 id, float noiseValue) {
+    Colors[getLinearIndex(id)] = float4(noiseValue, noiseValue, noiseValue, 1);
+}
+
+[numthreads(8,8,1)]
+void Perlin (uint3 id : SV_DispatchThreadID) {
+    if (isOutOfBounds(id)) {
+        return;
+    }
+
+    float noiseValue = generate3D != 0
+        ? saturate(perlinNoise((id.xyz + offset) / scale) * 0.5 + 0.5)
+        : perlinNoise((id.xy + offset.xy) / scale);
+    writeNoise(id, noiseValue);
+}
+
+[numthreads(8,8,1)]
+void Worley (uint3 id : SV_DispatchThreadID) {
+    if (isOutOfBounds(id)) {
+        return;
+    }
+
+    float noiseValue = generate3D != 0
+        ? worleyNoise((id.xyz + offset) / scale)
+        : worleyNoise((id.xy + offset.xy) / scale);
+    writeNoise(id, noiseValue);
+}
+
+[numthreads(8,8,1)]
+void Voronoi (uint3 id : SV_DispatchThreadID) {
+    if (isOutOfBounds(id)) {
+        return;
+    }
+
+    float noiseValue = generate3D != 0
+        ? voronoiNoise((id.xyz + offset) / scale)
+        : voronoiNoise((id.xy + offset.xy) / scale);
+    writeNoise(id, noiseValue);
+}
+
+[numthreads(8,8,1)]
+void Simplex (uint3 id : SV_DispatchThreadID) {
+    if (isOutOfBounds(id)) {
+        return;
+    }
+
+    float noiseValue = generate3D != 0
+        ? simplexNoise((id.xyz + offset) / scale)
+        : simplexNoise((id.xy + offset.xy) / scale);
+    writeNoise(id, noiseValue);
+}
+
+[numthreads(8,8,1)]
+void Fractal (uint3 id : SV_DispatchThreadID) {
+    if (isOutOfBounds(id)) {
+        return;
+    }
+
+    float noiseValue = generate3D != 0
+        ? fractalNoise((id.xyz + offset) / scale, octaves, persistence, lacunarity)
+        : fractalNoise((id.xy + offset.xy) / scale, octaves, persistence, lacunarity);
+    writeNoise(id, noiseValue);
+}
+
+// 其他噪声算法实现...
+
+// 蓝噪声专用参数
+float blueNoiseRadius;
+int blueNoiseSamples;
+// 蓝噪声生成函数（基于改进的泊松圆盘采样）
+void generateBlueNoise(uint3 id, out float noiseValue) {
+    float minDistance = 1e6;
+    uint seed = id.x * 731 + id.y * 283 + id.z * 199 + 593;
+    
+    for(int i = 0; i < blueNoiseSamples; i++) {
+        float jitterX = random(seed + i * 3) * 0.1;
+        float jitterY = random(seed + i * 3 + 1) * 0.1;
+        float jitterZ = random(seed + i * 3 + 2) * 0.1;
+
+        float dist;
+        if (generate3D != 0) {
+            float3 candidate = frac(float3(
+                Halton(i, 2) + jitterX,
+                Halton(i, 3) + jitterY,
+                Halton(i, 5) + jitterZ
+            ));
+
+            float3 delta = wrapDelta(candidate - (id.xyz + 0.5) / float3(width, height, depth));
+            delta *= float3(width, height, depth) / scale;
+            dist = length(delta);
+        }
+        else {
+            float2 candidate = frac(float2(
+                Halton(i, 2) + jitterX,
+                Halton(i, 3) + jitterY
+            ));
+
+            float2 delta = wrapDelta(candidate - (id.xy + 0.5) / float2(width, height));
+            delta *= float2(width, height) / scale;
+            dist = length(delta);
+        }
+        
+        // 保持最小距离
+        if(dist < minDistance) {
+            minDistance = dist;
+        }
+    }
+    
+    // 应用半径衰减
+    noiseValue = saturate(minDistance / blueNoiseRadius);
+}
+
+[numthreads(8,8,1)]
+void BlueNoise (uint3 id : SV_DispatchThreadID) {
+    if (isOutOfBounds(id)) {
+        return;
+    }
+
+    float noiseValue;
+    generateBlueNoise(id, noiseValue);
+    writeNoise(id, noiseValue);
+}
